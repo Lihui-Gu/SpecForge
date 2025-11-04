@@ -30,8 +30,10 @@ from transformers.cache_utils import DynamicCache
 
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding
+from specforge.utils import padding, build_causal_mask
+from transformers import AutoTokenizer
 
+tokenizer = AutoTokenizer.from_pretrained("/home/wangrunqi03/eagle_vlm_dataset/saved_models/qwen2p5_vl_0912_i2v_captioner_v49/")
 
 class Eagle3Model(nn.Module):
     pass
@@ -654,6 +656,129 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
+    def draft_generate(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: List[List],
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        seq_length_with_past: int = 0,
+        **kwargs,
+    ):
+        # 调用draft model进行decode，生成返回max_new_tokens长度的ids
+
+        lck = len(cache_hidden[0])
+        generated_ids = input_ids.clone()
+        hidden_states = hidden_states[:, seq_length_with_past:, :]
+        current_ids = input_ids[:, seq_length_with_past:]
+
+        for step in range(self.length):
+            bsz, seq_len = current_ids.shape
+            input_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
+            # 创建 causal mask
+            causal_mask = build_causal_mask(
+                bsz=bsz,
+                q_len=seq_len,
+                kv_len=seq_len if len(cache_hidden[0]) == 0 else cache_hidden[0][0].shape[2], # 感觉kv cache的管理机制有些不太合理
+            ).to(hidden_states.device)
+            # 创建 position_ids 需要输入 所有ids（包含prefill和之前decode的所有id）
+            # 看下get_rope_index 是否可以简化以下两个步骤
+            position_ids, _ = self.target_model.model.get_rope_index(
+                generated_ids,
+                image_grid_thw,
+                None,
+                second_per_grid_ts=None,
+                attention_mask=None,
+            )
+            position_ids = position_ids[:, :, -seq_len:]
+            inputs_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
+            # draft model 的推理
+            hidden_states_out = self.draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                cache_hidden=cache_hidden, # 使用 cache_hidden 管理kv cache
+                use_cache=True,
+            )
+            # 更新hidden states for draft model decoding
+            hidden_states = hidden_states_out[:, -1:, :]
+            # Step 5.4: get logits
+            logits = self.draft_model.compute_logits(hidden_states)
+            next_token_logits = logits[:, -1, :]  # [batch_size, vocab_size]
+            # 贪婪解码：选择概率最大的token，并映射会target的词表空间
+            next_token_ids = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            next_token_ids = next_token_ids + self.draft_model.d2t[next_token_ids]
+            # 添加到生成序列
+            generated_ids = torch.cat([generated_ids, next_token_ids], dim=1)
+            current_ids = next_token_ids
+        # 回退kv cache, 只保留第一次prefill
+        cache_hidden[0] = cache_hidden[0][:lck + 1]
+        cache_hidden[1] = cache_hidden[1][:lck + 1]
+        return generated_ids[:, -self.length:]
+    
+    def draft_token_valid(
+        self,
+        draft_ids,
+        target_ids
+    ):
+        acc_len = 0
+        for i in range(self.length):
+            if draft_ids[0][i] == target_ids[0][i]:
+                acc_len += 1
+            else:
+                break
+        return acc_len
+    
+    def evaluation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+    ):
+        # Step 0: prepare data with the target model
+        bsz, _ = input_ids.shape
+        assert bsz == 1 # only support bsz == 1 now
+
+        # step 1. 准备hidden_states by target model
+        hidden_states, _, _, input_ids = self._prepare_data(
+            input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
+        )
+
+        hidden_states = self.draft_model.project_hidden_states(hidden_states)
+
+        end_position = torch.argmax(loss_mask.squeeze(-1), dim=1, keepdim=True)[-1].item()
+        start_idx = 1
+        cache_hidden = [[], []] # 用于管理kv cache
+        seq_length_with_past = 0 # kv cache已经缓存的长度
+
+        while(end_position + self.length + start_idx < len(input_ids[0])):
+            target_ids = input_ids[:, end_position + start_idx:end_position + self.length + start_idx]
+            # draft model需要的输入
+            cur_hidden_states = hidden_states[:, :end_position + start_idx, :]
+            cur_input_ids = input_ids[:, :end_position + start_idx]
+
+            draft_ids = self.draft_generate(
+                cur_input_ids,
+                cur_hidden_states,
+                cache_hidden,
+                pixel_values,
+                image_grid_thw,
+                seq_length_with_past=seq_length_with_past
+            )
+
+            # 更新kv cache 已经缓存的长度
+            seq_length_with_past = end_position + start_idx
+            acc_len = self.draft_token_valid(draft_ids, target_ids)
+            print(draft_ids)
+            print(f"accept length : {acc_len} ...")
+            start_idx += 1
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():

@@ -639,13 +639,13 @@ class LlamaAttention(nn.Module):
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
             ).to(query_states.dtype)
-            attn_weights0 = attn_weights[..., :q_len]
+            attn_weights0 = attn_weights[..., :cache_hidden[0][0].shape[2]]
 
             attn_output = torch.matmul(attn_weights0, v0)
 
             for i in range(1, lck):
                 vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1]
+                attn_weightsi = attn_weights[..., cache_hidden[0][0].shape[2] + i - 1]
                 attn_outputi = attn_weightsi[..., None] * vi
                 attn_output = attn_output + attn_outputi
 
@@ -655,7 +655,6 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output
-
 
 class LlamaFlexAttention(LlamaAttention):
     """

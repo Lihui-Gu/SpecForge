@@ -9,3 +9,8 @@ def padding(tensor, left=True):
     else:
         tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
     return tensor
+
+def build_causal_mask(bsz, q_len, kv_len):
+    mask = torch.full((bsz, 1, q_len, kv_len), float("-inf"))
+    mask = torch.triu(mask, diagonal=1 + kv_len - q_len)
+    return mask
