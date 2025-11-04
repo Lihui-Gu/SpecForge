@@ -615,7 +615,6 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             # inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
             inputs_embeds = self.draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
@@ -624,7 +623,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=False,
             )
 
             # update hidden states for next step
@@ -680,7 +679,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             causal_mask = build_causal_mask(
                 bsz=bsz,
                 q_len=seq_len,
-                kv_len=seq_len if len(cache_hidden[0]) == 0 else cache_hidden[0][0].shape[2], # 感觉kv cache的管理机制有些不太合理
+                kv_len=seq_len+seq_length_with_past, # 感觉kv cache的管理机制有些不太合理
             ).to(hidden_states.device)
             # 创建 position_ids 需要输入 所有ids（包含prefill和之前decode的所有id）
             # 看下get_rope_index 是否可以简化以下两个步骤
@@ -693,14 +692,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             )
             position_ids = position_ids[:, :, -seq_len:]
             inputs_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
-            # draft model 的推理
+
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=None,
-                cache_hidden=cache_hidden, # 使用 cache_hidden 管理kv cache
+                cache_hidden=cache_hidden, # 使用 cache_hidden 管理kv cache, draft model generate 的时候 = True
                 use_cache=True,
             )
             # 更新hidden states for draft model decoding
@@ -714,6 +713,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             # 添加到生成序列
             generated_ids = torch.cat([generated_ids, next_token_ids], dim=1)
             current_ids = next_token_ids
+            seq_length_with_past += seq_len
         # 回退kv cache, 只保留第一次prefill
         cache_hidden[0] = cache_hidden[0][:lck + 1]
         cache_hidden[1] = cache_hidden[1][:lck + 1]
@@ -763,7 +763,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             # draft model需要的输入
             cur_hidden_states = hidden_states[:, :end_position + start_idx, :]
             cur_input_ids = input_ids[:, :end_position + start_idx]
-
+            
             draft_ids = self.draft_generate(
                 cur_input_ids,
                 cur_hidden_states,
@@ -772,13 +772,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 image_grid_thw,
                 seq_length_with_past=seq_length_with_past
             )
-
             # 更新kv cache 已经缓存的长度
             seq_length_with_past = end_position + start_idx
             acc_len = self.draft_token_valid(draft_ids, target_ids)
-            print(draft_ids)
-            print(f"accept length : {acc_len} ...")
-            start_idx += 1
+            print(f"### draft ids {draft_ids} ...")
+            print(f"### accept length : {acc_len} ...")
+            start_idx = start_idx + max(acc_len, 1)
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
