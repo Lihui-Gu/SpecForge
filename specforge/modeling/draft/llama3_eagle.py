@@ -18,6 +18,7 @@ from specforge.modeling.draft.flex_attention import (
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
+from .sparse_attention import Indexer
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -607,47 +608,28 @@ class LlamaAttention(nn.Module):
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            cache_hidden[0] = cache_hidden[0] + [key_states]
-            cache_hidden[1] = cache_hidden[1] + [value_states]
+            # training use_cache = Fales
+            if use_cache:
+                cache_hidden[0] = cache_hidden[0] + [key_states]
+                cache_hidden[1] = cache_hidden[1] + [value_states]
+            else:
+                cache_hidden[0] = [key_states]
+                cache_hidden[1] = [value_states]
 
             cache_k = cache_hidden[0]
             cache_v = cache_hidden[1]
 
-            k0 = cache_k[0]
-            v0 = cache_v[0]
-
-            # causal
-            attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
-                self.head_dim
-            )
-            lck = len(cache_k)
-
+            k_all = torch.cat(cache_k, dim=2)
+            attn_weights = torch.matmul(query_states, k_all.transpose(2, 3)) / math.sqrt(self.head_dim)
             attn_weights = attn_weights + attention_mask
-
-            for i in range(1, lck):
-                ki = cache_k[i]
-                qi = query_states
-                kiq = ki
-
-                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-                attn_weights = torch.cat(
-                    (attn_weights, attn_weightsi[..., None]), dim=-1
-                )
 
             # upcast attention to fp32
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
             ).to(query_states.dtype)
-            attn_weights0 = attn_weights[..., :q_len]
 
-            attn_output = torch.matmul(attn_weights0, v0)
-
-            for i in range(1, lck):
-                vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1]
-                attn_outputi = attn_weightsi[..., None] * vi
-                attn_output = attn_output + attn_outputi
+            v_all = torch.cat(cache_v, dim=2)
+            attn_output = torch.matmul(attn_weights, v_all) # (bzs, head_num, sql, head_dim)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
@@ -655,7 +637,6 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output
-
 
 class LlamaFlexAttention(LlamaAttention):
     """
@@ -840,8 +821,12 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "dsa":
+            self.indexer = Indexer(config)
+            self.self_attn = LlamaAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
+        self.attention_backend = attention_backend
 
         self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
@@ -879,6 +864,13 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
+        if self.attention_backend == "dsa":
+            index_mask = self.indexer(hidden_states, input_emb, attention_mask)
+            bsz, seq_len, _ = hidden_states.shape
+            attention_mask = prepare_decoder_attention_mask(
+                attention_mask, (bsz, seq_len), hidden_states, 0
+            )
+            attention_mask += index_mask
 
         residual = hidden_states
 
