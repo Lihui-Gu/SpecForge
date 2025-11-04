@@ -18,6 +18,7 @@ from specforge.modeling.draft.flex_attention import (
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
+from .sparse_attention import Indexer
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -839,6 +840,9 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "dsa":
+            self.indexer = Indexer(config)
+            self.self_attn = LlamaAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -878,6 +882,13 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
+        if attention_backend == "dsa":
+            index_mask = self.indexer(hidden_states, input_emb, attention_mask)
+            bsz, seq_len, _ = hidden_states.shape
+            attention_mask = prepare_decoder_attention_mask(
+                attention_mask, (bsz, seq_len), hidden_states, 0
+            )
+            attention_mask += index_mask
 
         residual = hidden_states
 
