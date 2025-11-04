@@ -1,7 +1,10 @@
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from specforge.kernel import act_quant, fp8_gemm, fp8_index
-from specforge.utils import print_with_rank, precompute_freqs_cis, apply_rotary_emb
+from specforge.utils import print_with_rank
+from specforge.modeling.utils import precompute_freqs_cis, apply_rotary_emb
 
 class LayerNorm(nn.Module):
     """

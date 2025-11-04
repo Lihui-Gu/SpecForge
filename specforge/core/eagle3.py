@@ -30,7 +30,7 @@ from transformers.cache_utils import DynamicCache
 
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding, build_causal_mask
+from specforge.modeling.utils import padding, build_causal_mask
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("/home/wangrunqi03/eagle_vlm_dataset/saved_models/qwen2p5_vl_0912_i2v_captioner_v49/")
