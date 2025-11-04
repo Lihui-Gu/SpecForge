@@ -373,6 +373,13 @@ def main():
     print_with_rank("Loaded vocab mapping")
 
     if args.eval_data_path is not None:
+        cache_params_string = (
+            f"{args.eval_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"  # Tokenizer may also different
+        )
+        cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
@@ -380,6 +387,8 @@ def main():
             args.chat_template,
             args.max_length,
             is_vlm=args.is_vlm,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
             is_preformatted=args.is_preformatted,
