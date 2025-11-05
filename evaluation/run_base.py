@@ -271,24 +271,10 @@ def main():
             length=args.ttt_length,
             attention_backend=args.attention_backend,
         )
-    
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        ignored_modules=[target_model],
-        process_group=get_dp_group(),
-    )
-    print_with_rank("Initialized Eagle3 FSDP model")
 
     # run evaluation
     draft_model.eval()
-    eval_acces = [[] for _ in range(eagle3_model.module.length)]
-    eval_plosses = [[] for _ in range(eagle3_model.module.length)]
+    eval_accept_length = []
 
     if dist.get_rank() == 0:
         progress_bar = tqdm(eval_dataloader, desc="Evaluating", leave=True)
@@ -301,14 +287,14 @@ def main():
     for data in progress_bar:
         if args.is_vlm:
             with torch.no_grad():
-                plosses, _, acces = eagle3_model.evaluation(
+                accept_length = eagle3_model.evaluation(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
-                    # sparse_attention_mask=data["sparse_attention_mask"].cuda(),
                     pixel_values=data["pixel_values"].cuda(),
                     image_grid_thw=data["image_grid_thw"].cuda(),
                 )
+                
         else:
             with torch.no_grad():
                 plosses, _, acces = eagle3_model(
@@ -317,73 +303,36 @@ def main():
                     loss_mask=data["loss_mask"].cuda(),
                 )
         
-        acces = torch.stack(acces).cpu().tolist()
-
-        eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
-        eval_plosses = [
-            eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
-        ]
-
+        eval_accept_length.append(accept_length)
         total_samples += data["input_ids"].shape[0]
 
         if args.verbose:
-            print(
-                f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
-            )
+            print(f"[{dist.get_rank()}] time={(time.time() - last_time):.3f}s shape={data['input_ids'].shape}")
             last_time = time.time()
 
         if dist.get_rank() == 0:
-            avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
-            avg_acc = sum(acces) / len(acces)
-            progress_bar.set_postfix(
-                {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}", "samples": total_samples}
-            )
+            avg_accept = sum(eval_accept_length) / len(eval_accept_length)
+            progress_bar.set_postfix({"accept_len": f"{avg_accept:.2f}", "samples": total_samples})
 
     # Synchronize and collect results from all devices
-    all_acces = []
-    all_plosses = []
-    
-    for i in range(len(eval_acces)):
-        # Synchronize accuracy
-        acc_i = torch.tensor(eval_acces[i]).cuda()
-        acc_mean = acc_i.mean()
-        dist.all_reduce(acc_mean)
-        acc_mean = (acc_mean / dist.get_world_size()).item()
-        
-        # Synchronize loss
-        loss_i = torch.tensor(eval_plosses[i]).cuda()
-        loss_mean = loss_i.mean()
-        dist.all_reduce(loss_mean)
-        loss_mean = (loss_mean / dist.get_world_size()).item()
-        
-        all_acces.append(acc_mean)
-        all_plosses.append(loss_mean)
+    local_accept_tensor = torch.tensor(eval_accept_length, dtype=torch.float32, device="cuda")
+    total_accept_tensor = torch.zeros_like(local_accept_tensor)
+    dist.all_reduce(local_accept_tensor, op=dist.ReduceOp.SUM)
 
-    # Synchronize total samples
-    total_samples_tensor = torch.tensor(total_samples).cuda()
-    dist.all_reduce(total_samples_tensor)
-    total_samples = total_samples_tensor.item()
+    # 汇总总样本数量
+    total_samples_tensor = torch.tensor(total_samples, dtype=torch.float32, device="cuda")
+    dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
+
+    # 计算平均 accept length
+    overall_accept_length = (local_accept_tensor.sum() / total_samples_tensor).item()
 
     # Only rank 0 prints the results
     if dist.get_rank() == 0:
-        # Calculate overall metrics
-        overall_acc = sum(all_acces) / len(all_acces)
-        overall_loss = sum(all_plosses) / len(all_plosses)
-
-        # Print results in table format
         print("\n" + "="*70)
-        print("EVALUATION RESULTS (Synchronized across all devices)")
+        print("EVALUATION RESULTS — Accept Length")
         print("="*70)
-        print(f"{'Position':<10} {'Accuracy':<12} {'Loss':<12}")
-        print("-"*70)
-        
-        for i in range(len(all_acces)):
-            print(f"{i:<10} {all_acces[i]:<12.4f} {all_plosses[i]:<12.4f}")
-        
-        print("-"*70)
-        print(f"{'OVERALL':<10} {overall_acc:<12.4f} {overall_loss:<12.4f}")
-        print("="*70)
-        print(f"Total samples evaluated: {total_samples}")
+        print(f"Average Accept Length (across all samples & devices): {overall_accept_length:.4f}")
+        print(f"Total samples evaluated: {int(total_samples_tensor.item())}")
         print("="*70)
 
     destroy_distributed()

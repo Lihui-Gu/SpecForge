@@ -1022,5 +1022,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=False,
-            use_cache=False,
+            use_cache=use_cache,
         )

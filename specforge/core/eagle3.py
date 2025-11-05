@@ -672,7 +672,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         hidden_states = hidden_states[:, seq_length_with_past:, :]
         current_ids = input_ids[:, seq_length_with_past:]
 
-        for step in range(self.length):
+        for step in range(self.length - 1):
             bsz, seq_len = current_ids.shape
             input_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
             # 创建 causal mask
@@ -717,20 +717,28 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # 回退kv cache, 只保留第一次prefill
         cache_hidden[0] = cache_hidden[0][:lck + 1]
         cache_hidden[1] = cache_hidden[1][:lck + 1]
-        return generated_ids[:, -self.length:]
+        return generated_ids[:, -(self.length-1):]
     
     def draft_token_valid(
         self,
         draft_ids,
         target_ids
     ):
-        acc_len = 0
+        bsz = draft_ids.shape[0]
+        acc_len = torch.zeros(bsz, dtype=torch.long, device=draft_ids.device)
+        
         for i in range(self.length):
-            if draft_ids[0][i] == target_ids[0][i]:
-                acc_len += 1
-            else:
-                break
-        return acc_len
+            # 比较当前batch中所有样本在第i个位置的token是否相等
+            mask = (draft_ids[:, i] == target_ids[:, i])
+            
+            # 只有之前所有位置都匹配的样本才继续计数
+            still_valid = (acc_len == i)  # 之前所有位置都匹配的样本
+            can_increment = mask & still_valid
+            
+            # 为仍然匹配的样本增加计数
+            acc_len[can_increment] += 1
+    
+        return acc_len.float().mean()
     
     def evaluation(
         self,
@@ -750,20 +758,23 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         hidden_states, _, _, input_ids = self._prepare_data(
             input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
         )
-
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
-        end_position = torch.argmax(loss_mask.squeeze(-1), dim=1, keepdim=True)[-1].item()
+        start_pos = torch.argmax(loss_mask.squeeze(-1), dim=1, keepdim=True)[-1].item()
         start_idx = 1
-        cache_hidden = [[], []] # 用于管理kv cache
-        seq_length_with_past = 0 # kv cache已经缓存的长度
+        cache_hidden = [[], []]
+        seq_length_with_past = 0 
 
-        while(end_position + self.length + start_idx < len(input_ids[0])):
-            target_ids = input_ids[:, end_position + start_idx:end_position + self.length + start_idx]
-            # draft model需要的输入
-            cur_hidden_states = hidden_states[:, :end_position + start_idx, :]
-            cur_input_ids = input_ids[:, :end_position + start_idx]
-            
+        round_num = 0
+        avg_accept_length = 0
+        while(start_pos + self.length + start_idx - 1 < len(input_ids[0])):
+            target_ids = input_ids[:, start_pos + start_idx - 1:start_pos + self.length + start_idx - 1]
+            cur_hidden_states = hidden_states[:, :start_pos + start_idx, :].clone()
+            cur_input_ids = input_ids[:, :start_pos + start_idx].clone()
+            cur_input_text = tokenizer.decode(
+                cur_input_ids[0][-10:],
+                skip_special_tokens=True
+            )
             draft_ids = self.draft_generate(
                 cur_input_ids,
                 cur_hidden_states,
@@ -772,12 +783,18 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 image_grid_thw,
                 seq_length_with_past=seq_length_with_past
             )
-            # 更新kv cache 已经缓存的长度
-            seq_length_with_past = end_position + start_idx
-            acc_len = self.draft_token_valid(draft_ids, target_ids)
-            print(f"### draft ids {draft_ids} ...")
-            print(f"### accept length : {acc_len} ...")
-            start_idx = start_idx + max(acc_len, 1)
+            # target model output token
+            draft_ids = torch.cat([cur_input_ids[:, -1:], draft_ids], dim=-1)
+
+            # 更新kv cache 已经缓存的长度，draft generate 只缓存输入，不缓存decode输出的draft token
+            seq_length_with_past = start_pos + start_idx
+            accept_length = self.draft_token_valid(draft_ids, target_ids)
+            avg_accept_length += accept_length
+            round_num += 1
+            start_idx += self.length
+
+        avg_accept_length /= round_num
+        return avg_accept_length
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
