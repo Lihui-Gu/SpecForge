@@ -1,12 +1,14 @@
 from typing import List, Optional, Tuple
 import math
+from einops import rearrange
 
 import torch
-import torch.nn as nn
+from torch import nn
+import torch.nn.functional as F
+
 from specforge.kernel import act_quant, fp8_gemm, fp8_index
 from specforge.utils import print_with_rank
 from specforge.modeling.utils import precompute_freqs_cis, apply_rotary_emb
-
 class LayerNorm(nn.Module):
     """
     Layer Normalization.
@@ -132,14 +134,15 @@ class Indexer(torch.nn.Module):
         self, 
         hidden_states: torch.Tensor, 
         input_emb: torch.Tensor, 
-        mask: Optional[torch.Tensor]
+        cache_hidden: List[List[torch.Tensor]],
+        mask: Optional[torch.Tensor],
     ):
+        assert input_emb.shape[1] == hidden_states.shape[1]
         bsz, seq_len, _ = hidden_states.shape
-        start_pos = 0
+        start_pos = sum(cache.shape[1] for cache in cache_hidden[2])
         freqs_cis = self.freqs_cis[start_pos:start_pos + seq_len]
-
-        bsz, seqlen, _ = hidden_states.size()
-        end_pos = start_pos + seqlen
+        end_pos = start_pos + seq_len
+        
         q = self.wq_b(input_emb)
         q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
@@ -157,15 +160,24 @@ class Indexer(torch.nn.Module):
 
         # self.k_cache[:bsz, start_pos:end_pos] = k_fp8
         # self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+        if cache_hidden is not None:
+            cache_hidden[2] += [k_fp8]
+            cache_hidden[3] += [k_scale]
+
         weights = self.weights_proj(hidden_states) * self.num_heads ** -0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-        index_score = fp8_index(q_fp8.contiguous(), weights, k_fp8.contiguous(), k_scale.contiguous())
-        if mask is not None:
-            index_score += mask
+        all_k_fp8 = torch.cat(cache_hidden[2], dim=1) # 按seq_len维度拼接 
+        all_k_scale = torch.cat(cache_hidden[3], dim=1)
+
+        index_score = fp8_index(q_fp8.contiguous(), weights, all_k_fp8.contiguous(), all_k_scale.contiguous()) # (bsz, q_len, kv_len)
+        bsz, q_len, kv_len = index_score.shape
+        ## TODO
+        if mask is not None: # (bsz, 1, q_len, kv_len)
+            index_score += mask.squeeze(1) 
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
         # topk_indices_ = topk_indices.clone()
         # dist.broadcast(topk_indices_, src=0)
         # assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
-        index_mask = torch.full((bsz, seq_len, seq_len), float("-inf"), device=hidden_states.device).scatter_(-1, topk_indices, 0).unsqueeze(1) # （bsz, 1, sql_len, sql_len）
+        index_mask = torch.full((bsz, q_len, kv_len), float("-inf"), device=hidden_states.device).scatter_(-1, topk_indices, 0).unsqueeze(1) # （bsz, 1, sql_len, sql_len）
         return index_mask

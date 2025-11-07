@@ -138,7 +138,7 @@ def process_sharegpt4v_row(row) -> Dict:
     }
     """
     conversations = row["conversations"]
-    image = f'FreedomIntelligence/ALLaVA-4V/{row["image"]}'
+    image = f'/root/.cache/huggingface/hub/datasets--FreedomIntelligence--ALLaVA-4V/snapshots/0fd42fce5c047d387a4bb5318d588eae9a9797f0/{row["image"]}'
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None

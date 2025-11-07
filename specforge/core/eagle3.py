@@ -33,7 +33,7 @@ from specforge.modeling.draft import Eagle3DraftModel
 from specforge.modeling.utils import padding, build_causal_mask
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("/home/wangrunqi03/eagle_vlm_dataset/saved_models/qwen2p5_vl_0912_i2v_captioner_v49/")
+tokenizer = AutoTokenizer.from_pretrained("/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5/")
 
 class Eagle3Model(nn.Module):
     pass
@@ -194,6 +194,7 @@ class OnlineEagle3Model(Eagle3Model):
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
+
         if position_ids is None:
             device = hidden_states.device
             position_ids = torch.arange(
@@ -213,7 +214,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa" or self.attention_backend == "dsa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -221,6 +222,8 @@ class OnlineEagle3Model(Eagle3Model):
                 seq_length=seq_length,
                 past_key_values_length=past_key_values_length,
             )
+            print("===")
+            print(attention_mask.shape)
 
         # Step 5: run TTT
         plosses = []
@@ -232,6 +235,9 @@ class OnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "dsa":
+            cache_hidden = [[], [], [], []]
+            past_key_values = None
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -587,7 +593,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa" or self.attention_backend == "dsa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -600,20 +606,26 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
-            cache_hidden = [[], []]
-            past_key_values = None
-        elif self.attention_backend == "flex_attention":
-            cache_hidden = None
-            past_key_values = DynamicCache()
 
         for idx in range(self.length):
+
+            if self.attention_backend == "sdpa":
+                cache_hidden = [[], [], [], []] # 前两个用于attention，后两个用于fp8 k_cache k_scale for indexer
+                past_key_values = None
+            elif self.attention_backend == "flex_attention":
+                cache_hidden = None
+                past_key_values = DynamicCache()
+            elif self.attention_backend == "dsa":
+                cache_hidden =[[], [], [], []] # 前两个用于attention，后两个用于fp8 k_cache k_scale for indexer
+                past_key_values = None
+                past_key_values = DynamicCache()
+                
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            # inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
+            # inputs_embeds = self.draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
@@ -660,6 +672,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_hidden: List[List],
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         seq_length_with_past: int = 0,
@@ -671,18 +684,37 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         generated_ids = input_ids.clone()
         hidden_states = hidden_states[:, seq_length_with_past:, :]
         current_ids = input_ids[:, seq_length_with_past:]
+        bsz, seq_len = current_ids.shape
+        
+        past_seen_tokens = seq_len + (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
 
         for step in range(self.length - 1):
             bsz, seq_len = current_ids.shape
-            input_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
+            # 1. 只有第一次prefill的时候使用vision embedding
+            if seq_length_with_past == 0:
+                inputs_embeds = self._get_input_embeds(current_ids, pixel_values, image_grid_thw).to(hidden_states.dtype)
+            else:
+                # 2. 不使用vision embedding，后续decoder都不需要vision embedding
+                inputs_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
+
             # 创建 causal mask
-            causal_mask = build_causal_mask(
-                bsz=bsz,
-                q_len=seq_len,
-                kv_len=seq_len+seq_length_with_past, # 感觉kv cache的管理机制有些不太合理
-            ).to(hidden_states.device)
+            if self.attention_backend == "sdpa":
+                causal_mask = build_causal_mask(
+                    bsz=bsz,
+                    q_len=seq_len,
+                    kv_len=seq_len+seq_length_with_past, # 感觉kv cache的管理机制有些不太合理
+                ).to(hidden_states.device)
+            elif self.attention_backend == "flex_attention":
+                causal_mask = torch.ones(
+                    (bsz, seq_len+seq_length_with_past),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
             # 创建 position_ids 需要输入 所有ids（包含prefill和之前decode的所有id）
             # 看下get_rope_index 是否可以简化以下两个步骤
+
             position_ids, _ = self.target_model.model.get_rope_index(
                 generated_ids,
                 image_grid_thw,
@@ -691,14 +723,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 attention_mask=None,
             )
             position_ids = position_ids[:, :, -seq_len:]
-            inputs_embeds = self.draft_model.embed_input_ids(current_ids).to(hidden_states.dtype)
-
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_values=None,
+                past_key_values=past_key_values,
                 cache_hidden=cache_hidden, # 使用 cache_hidden 管理kv cache, draft model generate 的时候 = True
                 use_cache=True,
             )
@@ -714,9 +744,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             generated_ids = torch.cat([generated_ids, next_token_ids], dim=1)
             current_ids = next_token_ids
             seq_length_with_past += seq_len
-        # 回退kv cache, 只保留第一次prefill
+
         cache_hidden[0] = cache_hidden[0][:lck + 1]
         cache_hidden[1] = cache_hidden[1][:lck + 1]
+        cache_hidden[2] = cache_hidden[2][:lck + 1]
+        cache_hidden[3] = cache_hidden[3][:lck + 1]
+
+        past_key_values.crop(past_seen_tokens)
+
         return generated_ids[:, -(self.length-1):]
     
     def draft_token_valid(
@@ -762,7 +797,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
         start_pos = torch.argmax(loss_mask.squeeze(-1), dim=1, keepdim=True)[-1].item()
         start_idx = 1
-        cache_hidden = [[], []]
+
+        cache_hidden =[[], [], [], []] # 前两个用于attention，后两个用于fp8 k_cache k_scale for indexer
+        past_key_values = DynamicCache()
+
         seq_length_with_past = 0 
 
         round_num = 0
@@ -776,16 +814,16 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 skip_special_tokens=True
             )
             draft_ids = self.draft_generate(
-                cur_input_ids,
-                cur_hidden_states,
-                cache_hidden,
-                pixel_values,
-                image_grid_thw,
+                input_ids=cur_input_ids,
+                hidden_states=cur_hidden_states,
+                cache_hidden=cache_hidden,
+                past_key_values=past_key_values,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
                 seq_length_with_past=seq_length_with_past
             )
             # target model output token
             draft_ids = torch.cat([cur_input_ids[:, -1:], draft_ids], dim=-1)
-
             # 更新kv cache 已经缓存的长度，draft generate 只缓存输入，不缓存decode输出的draft token
             seq_length_with_past = start_pos + start_idx
             accept_length = self.draft_token_valid(draft_ids, target_ids)

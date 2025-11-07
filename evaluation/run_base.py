@@ -294,14 +294,6 @@ def main():
                     pixel_values=data["pixel_values"].cuda(),
                     image_grid_thw=data["image_grid_thw"].cuda(),
                 )
-                
-        else:
-            with torch.no_grad():
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
         
         eval_accept_length.append(accept_length)
         total_samples += data["input_ids"].shape[0]

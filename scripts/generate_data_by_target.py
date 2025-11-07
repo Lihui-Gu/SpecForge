@@ -15,6 +15,9 @@ python scripts/generate_data_by_target.py \
     --server-address-port 127.0.0.1:30001 \
     --is-reasoning-model \
     --is-gpt-oss
+    
+python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-7B-Instruct --cuda-graph-bs 1 --mem-frac=0.7 --tp 1 --port 30001
+python scripts/generate_data_by_target.py --model-name Qwen/Qwen2.5-VL-7B-Instruct --raw-data-file /home/gulihui/workspace/dev_github/SpecForge/cache/dataset/allava4v_train.jsonl --output-dir /home/wangrunqi03/eagle_vlm_dataset/vlm_spec_specforce_data/allava4v/ --max-concurrency 512 --num-per-shard 2000 --server-address-port 127.0.0.1:30001 --is-vlm
 """
 
 import argparse
@@ -29,8 +32,9 @@ from datasets import load_dataset
 from openai import AsyncOpenAI, OpenAI, OpenAIError
 from tqdm.asyncio import tqdm
 
-SYSTEM_PROMPT = ""
+# SYSTEM_PROMPT = "You are a video caption generator. You should write detailed target video captions based on the given image and user prompt, the image is the first frame of the video described by the target video caption you generated. The image is represented by its image caption. The target video captions should strictly follow the user's instruction while maintaining necessary content consistency with the image captions."
 # SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
+SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 def parse_args():
@@ -43,12 +47,15 @@ def parse_args():
     parser.add_argument("--max-concurrency", type=int, default=None)
     parser.add_argument("--num-per-shard", type=int, default=50_000)
     parser.add_argument("--disable-tqdm", action="store_true")
-    parser.add_argument("--max-tokens", type=int, default=16 * 1024)
+    parser.add_argument("--max-tokens", type=int, default=8 * 1024)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=-1)
     parser.add_argument(
         "--server-address-port", type=str, nargs="+", default=["127.0.0.1:30000"]
     )
     parser.add_argument("--is-reasoning-model", action="store_true")
     parser.add_argument("--is-gpt-oss", action="store_true")
+    parser.add_argument("--is-vlm", action="store_true")
     return parser.parse_args()
 
 
@@ -58,6 +65,7 @@ class RequestFuncObject:
     input_conversations: List[Dict[str, str]]
     model_name: str
     system_prompt: Optional[str]
+    image: Optional[str] = None
     temperature: float = 0.0
     max_tokens: int = 16 * 1024
     output_conversations: Optional[List[Dict[str, str]]] = None
@@ -67,12 +75,21 @@ class RequestFuncObject:
     extra_body: Dict[str, Any] = field(default_factory=dict)
 
 
+import base64
+
+def image_to_base64(image_path: str) -> str:
+    """Convert image file to Base64 string"""
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode("utf-8")
+
 async def build_conversation(
     req_obj: RequestFuncObject, client: AsyncOpenAI, pbar: Optional[tqdm] = None
 ) -> str:
     messages = []
+    messages_for_server = []
     if req_obj.system_prompt is not None and len(req_obj.system_prompt) > 0:
         messages.append({"role": "system", "content": req_obj.system_prompt})
+        messages_for_server.append({"role": "system", "content": req_obj.system_prompt})
     req_obj.output_tokens = 0
     for conversation in req_obj.input_conversations:
         if conversation["role"] == "assistant":
@@ -80,9 +97,17 @@ async def build_conversation(
         if conversation["role"] == "user":
             messages.append({"role": "user", "content": conversation["content"]})
             try:
+                if req_obj.image is not None:
+                    content = [
+                        {"type": "image_url", "image_url": {"url": req_obj.image}},
+                        {"type": "text", "text": conversation["content"]}
+                    ]
+                else:
+                    content = conversation["content"]
+                messages_for_server.append({"role": "user", "content": content})
                 response = await client.chat.completions.create(
                     model=req_obj.model_name,
-                    messages=messages,
+                    messages=messages_for_server,
                     max_tokens=req_obj.max_tokens,
                     temperature=req_obj.temperature,
                     stream=False,
@@ -91,6 +116,7 @@ async def build_conversation(
                 req_obj.output_tokens += response.usage.completion_tokens
                 if req_obj.is_reasoning_model:
                     reasoning_content = response.choices[0].message.reasoning_content
+                
             except Exception as e:
                 req_obj.error = str(e)
                 break
@@ -143,8 +169,11 @@ async def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     total_ds = load_dataset("json", data_files=args.raw_data_file)["train"]
-    # total_ds = total_ds.select(range(10)) # used to debug
-    for start in range(0, len(total_ds), args.num_per_shard):
+
+    range_start = args.start
+    range_end = len(total_ds) if args.end == -1 else min(args.end, len(total_ds))
+
+    for start in range(range_start, range_end, args.num_per_shard):
         end = min(start + args.num_per_shard, len(total_ds))
         output_file = os.path.join(args.output_dir, f"shard_{start}-{end}.jsonl")
         output_file_error = os.path.join(args.output_dir, f"error_{start}-{end}.jsonl")
@@ -190,6 +219,7 @@ async def main():
                 input_conversations=row["conversations"],
                 model_name=args.model_name,
                 system_prompt=SYSTEM_PROMPT,
+                image=row["image"] if args.is_vlm else None,
                 temperature=get_random_temperature(),
                 max_tokens=args.max_tokens,
                 is_reasoning_model=args.is_reasoning_model,
@@ -213,6 +243,8 @@ async def main():
                     "conversation_id": output_obj.conversation_id,
                     "conversations": output_obj.output_conversations,
                 }
+                if args.is_vlm:
+                    output_dict["image"] = output_obj.image
                 if args.is_gpt_oss:
                     output_dict["reasoning_effort"] = output_obj.extra_body[
                         "reasoning_effort"

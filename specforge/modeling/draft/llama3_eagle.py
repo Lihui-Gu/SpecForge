@@ -865,12 +865,15 @@ class LlamaDecoderLayer(nn.Module):
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
         if self.attention_backend == "dsa":
-            index_mask = self.indexer(hidden_states, input_emb, attention_mask)
-            bsz, seq_len, _ = hidden_states.shape
-            attention_mask = prepare_decoder_attention_mask(
-                attention_mask, (bsz, seq_len), hidden_states, 0
-            )
-            attention_mask += index_mask
+            attention_mask = self.indexer(hidden_states, input_emb, cache_hidden, mask=attention_mask)
+        # attention_mask += index_mask
+        """
+        bsz, seq_len, _ = hidden_states.shape
+        attention_mask = prepare_decoder_attention_mask(
+            attention_mask, (bsz, seq_len), hidden_states, 0
+        )
+        attention_mask += index_mask
+        """
 
         residual = hidden_states
 
