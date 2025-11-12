@@ -15,7 +15,6 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from specforge import (
-    AutoDistributedTargetModel,
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
@@ -31,6 +30,9 @@ from specforge.distributed import (
     get_dp_group,
     get_tp_device_mesh,
     init_distributed,
+)
+from specforge.evaluator import (
+    QwenVLEagle3Evaluator
 )
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
@@ -65,7 +67,6 @@ def parse_args():
     )
 
     # add evaluation-related arguments
-    parser.add_argument("--train-data-path", type=str, required=True) # for vocab mapping
     parser.add_argument("--eval-data-path", type=str, required=True)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=2048)
@@ -131,47 +132,27 @@ def main():
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # build target model
-    if args.tp_size > 1:
-        # check if the target model has tp_plan
-        config = AutoConfig.from_pretrained(args.target_model_path)
+    if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
 
-        if type(config) in AutoDistributedTargetModel._model_mapping:
-            target_model = AutoDistributedTargetModel.from_pretrained(
+        target_model = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
                 torch_dtype=torch.bfloat16,
-                device="cuda",
-                local_files_only=True,
-            ).eval()
-        else:
-            target_model = AutoModelForCausalLM.from_pretrained(
-                args.target_model_path,
-                tp_plan="auto",
-                tp_size=args.tp_size,
-                torch_dtype=torch.bfloat16,
-                device_mesh=get_tp_device_mesh(),
-            ).eval()
+            )
+            .eval()
+            .cuda()
+        )
     else:
-        if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
-            from transformers import Qwen2_5_VLForConditionalGeneration
-
-            target_model = (
-                Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
-                )
-                .eval()
-                .cuda()
+        target_model = (
+            AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=args.target_model_path,
+                torch_dtype=torch.bfloat16,
+                cache_dir=args.cache_dir,
             )
-        else:
-            target_model = (
-                AutoModelForCausalLM.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
-                    cache_dir=args.cache_dir,
-                )
-                .eval()
-                .cuda()
-            )
+            .eval()
+            .cuda()
+        )
 
     for p in target_model.parameters():
         p.requires_grad = False
@@ -184,8 +165,8 @@ def main():
         attention_backend=args.attention_backend,
         torch_dtype=torch.bfloat16,
     ).cuda()
-    
-    # 加载embedding和vocab mapping
+
+    # load embedding
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Loaded trained draft model")
@@ -202,14 +183,6 @@ def main():
         processor = None
 
     # convert to dataloader
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"
-    )
-    vocab_cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    
     cache_params_string = (
         f"{args.eval_data_path}-"
         f"{args.max_length}-"
@@ -233,14 +206,7 @@ def main():
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=eval_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=vocab_cache_key,
-        )
-    
+
     eval_dataloader = prepare_dp_dataloaders(
         eval_eagle3_dataset,
         args.batch_size,
@@ -250,10 +216,6 @@ def main():
         is_vlm=args.is_vlm,
     )
     print_with_rank("Initialized eval dataloader")
-
-    # load vocab mapping
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
 
     # build Eagle3 model
     if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
@@ -274,6 +236,9 @@ def main():
 
     # run evaluation
     draft_model.eval()
+
+    evaluator = QwenVLEagle3Evaluator(eagle3_model)
+
     eval_accept_length = []
 
     if dist.get_rank() == 0:
@@ -287,14 +252,23 @@ def main():
     for data in progress_bar:
         if args.is_vlm:
             with torch.no_grad():
-                accept_length = eagle3_model.evaluation(
+                accept_length = evaluator.evaluation(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                     pixel_values=data["pixel_values"].cuda(),
                     image_grid_thw=data["image_grid_thw"].cuda(),
                 )
-        
+                """
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                    pixel_values=data["pixel_values"].cuda(),
+                    image_grid_thw=data["image_grid_thw"].cuda(),
+                )
+                """
+        exit()
         eval_accept_length.append(accept_length)
         total_samples += data["input_ids"].shape[0]
 
@@ -311,11 +285,10 @@ def main():
     total_accept_tensor = torch.zeros_like(local_accept_tensor)
     dist.all_reduce(local_accept_tensor, op=dist.ReduceOp.SUM)
 
-    # 汇总总样本数量
     total_samples_tensor = torch.tensor(total_samples, dtype=torch.float32, device="cuda")
     dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
 
-    # 计算平均 accept length
+    # calculate accept length
     overall_accept_length = (local_accept_tensor.sum() / total_samples_tensor).item()
 
     # Only rank 0 prints the results

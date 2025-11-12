@@ -2,9 +2,9 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # support tp1 train eagle3 for qwen2.5-vl-7b-instruct
-NUM_GPUS=4
+NUM_GPUS=8
 
 torchrun \
     --standalone \
@@ -17,7 +17,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3-dsa \
     --num-epochs 10 \
     --batch-size 1 \
-    --draft-global-batch-size 8 \
+    --draft-global-batch-size 16 \
     --draft-micro-batch-size 2 \
     --learning-rate 1e-4 \
     --max-length 8192 \

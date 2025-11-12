@@ -6,6 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from transformers.cache_utils import Cache
 from specforge.kernel import act_quant, fp8_gemm, fp8_index
 from specforge.utils import print_with_rank
 from specforge.modeling.utils import precompute_freqs_cis, apply_rotary_emb
@@ -113,71 +114,89 @@ class Indexer(torch.nn.Module):
         super().__init__()
         self.config = config
         self.dim: int = config.hidden_size
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_attention_heads = config.num_attention_heads
         self.num_heads: int = config.index_n_heads
         self.head_dim: int = config.index_head_dim
         self.rope_head_dim: int = config.qk_rope_head_dim
         self.index_topk: int = config.index_topk
-        self.q_lora_rank: int = config.hidden_size
-        self.wq_b = Linear(self.q_lora_rank, self.num_heads * self.head_dim)
-        self.wk = Linear(self.dim, self.head_dim)
+        self.wq_b = Linear(config.head_dim, self.num_heads * self.head_dim)
+        self.wk = Linear(config.head_dim, self.head_dim)
         self.k_norm = LayerNorm(self.head_dim)
-        self.weights_proj = Linear(self.dim, self.num_heads, dtype=torch.get_default_dtype())
+        self.weights_proj = Linear(config.head_dim, self.num_heads, dtype=torch.get_default_dtype())
         self.softmax_scale = self.head_dim ** -0.5
         self.scale_fmt = None
         self.block_size = config.index_block_size
         self.register_buffer("freqs_cis", precompute_freqs_cis(config), persistent=False)
 
-        # self.register_buffer("k_cache", torch.zeros(config.max_batch_size, config.max_seq_len, config.index_head_dim, dtype=torch.float8_e4m3fn), persistent=False)
-        # self.register_buffer("k_scale_cache", torch.zeros(config.max_batch_size, config.max_seq_len, config.index_head_dim // config.index_block_size, dtype=torch.float32), persistent=False)
-
     def forward(
         self, 
-        hidden_states: torch.Tensor, 
-        input_emb: torch.Tensor, 
+        query_states: torch.Tensor, 
+        key_states: torch.Tensor,
         cache_hidden: List[List[torch.Tensor]],
+        past_key_values: Optional[Cache],
         mask: Optional[torch.Tensor],
+        use_cache: bool = False
     ):
-        assert input_emb.shape[1] == hidden_states.shape[1]
-        bsz, seq_len, _ = hidden_states.shape
-        start_pos = sum(cache.shape[1] for cache in cache_hidden[2])
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seq_len]
-        end_pos = start_pos + seq_len
-        
-        q = self.wq_b(input_emb)
+        bsz, _, seq_len, _ = query_states.shape
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        end_pos = past_seen_tokens + seq_len
+        _, _, q_len, kv_len = mask.shape
+        query_states = rearrange(query_states, 'b n s d -> (b n) s d', n=self.num_attention_heads)
+        key_states = rearrange(key_states, 'b n s d -> (b n) s d', n=self.num_key_value_heads)
+
+        q = self.wq_b(query_states)
         q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
-        q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        k = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
-        k = torch.cat([k_pe, k_nope], dim=-1)
-        q = rotate_activation(q)
-        k = rotate_activation(k)
+        k = self.wk(key_states)
+        k = self.k_norm(k) # (bsz, sql, index_head_num)
+
         q_fp8, q_scale = act_quant(q, self.block_size, self.scale_fmt)
         k_fp8, k_scale = act_quant(k, self.block_size, self.scale_fmt)
 
-        # self.k_cache[:bsz, start_pos:end_pos] = k_fp8
-        # self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
-        if cache_hidden is not None:
-            cache_hidden[2] += [k_fp8]
-            cache_hidden[3] += [k_scale]
+        if use_cache and past_key_values is not None:
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + q_len, device=query_states.device
+            )
+            cache_kwargs = {"cache_position": cache_position}
 
-        weights = self.weights_proj(hidden_states) * self.num_heads ** -0.5
+            k_fp8_cache, _ = past_key_values.update(
+                k_fp8,
+                torch.empty_like(k_fp8),
+                layer_idx=1,  # TODO: support multiple layers
+                cache_kwargs=cache_kwargs,
+            )
+
+            k_scale_cache, _ = past_key_values.update(
+                k_scale,
+                torch.empty_like(k_scale),
+                layer_idx=2,  # TODO: support multiple layers
+                cache_kwargs=cache_kwargs,
+            )
+        else:
+            k_fp8_cache, k_scale_cache = k_fp8, k_scale
+
+        weights = self.weights_proj(query_states) * self.num_heads ** -0.5
+
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        
+        index_score = fp8_index(q_fp8.contiguous(), weights, k_fp8_cache.contiguous(), k_scale_cache.contiguous()) # (bsz, q_len, kv_len)
+        index_score = rearrange(index_score, '(b n) s d -> b n s d', n=self.num_attention_heads)
 
-        all_k_fp8 = torch.cat(cache_hidden[2], dim=1) # 按seq_len维度拼接 
-        all_k_scale = torch.cat(cache_hidden[3], dim=1)
-
-        index_score = fp8_index(q_fp8.contiguous(), weights, all_k_fp8.contiguous(), all_k_scale.contiguous()) # (bsz, q_len, kv_len)
-        bsz, q_len, kv_len = index_score.shape
-        ## TODO
         if mask is not None: # (bsz, 1, q_len, kv_len)
-            index_score += mask.squeeze(1) 
+            index_score += mask
+
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
-        # topk_indices_ = topk_indices.clone()
-        # dist.broadcast(topk_indices_, src=0)
-        # assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
-        index_mask = torch.full((bsz, q_len, kv_len), float("-inf"), device=hidden_states.device).scatter_(-1, topk_indices, 0).unsqueeze(1) # （bsz, 1, sql_len, sql_len）
-        return index_mask
+            
+        index_mask = torch.full(
+            (bsz, self.num_attention_heads, q_len, kv_len),
+            float("-inf"),
+            device=query_states.device
+        ).scatter_(-1, topk_indices, 0)
+
+        # 改回来
+        query_states = rearrange(query_states, '(b n) s d -> b n s d', n=self.num_attention_heads)
+        key_states = rearrange(key_states, '(b n) s d -> b n s d', n=self.num_key_value_heads)
+
+        return index_mask, topk_indices

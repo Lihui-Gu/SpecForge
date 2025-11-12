@@ -1,6 +1,6 @@
 import math
 from typing import List, Optional, Tuple
-
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +19,7 @@ from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
 from .sparse_attention import Indexer
+from torch.cuda import nvtx
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -174,6 +175,29 @@ def prepare_decoder_attention_mask(
 
     return combined_attention_mask
 
+# @torch.compile(dynamic=True)
+def optimized_topk_attention(query_states, all_key_states, all_value_states, topk_indices, head_dim):
+    bsz, head_num, q_len, K = topk_indices.shape
+    # 优化1：避免不必要的expand，直接使用gather
+    expanded_indices = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, head_dim)
+    # 优化2：直接在第2维（kv_len维度）进行gather
+    topk_key_states = torch.gather(
+        all_key_states.unsqueeze(2),  # (bsz, head_num, 1, kv_len, dim) -> 为q_len=1添加维度
+        dim=3, 
+        index=expanded_indices
+    ).squeeze(2)  # (bsz, head_num, K, dim)
+    
+    topk_value_states = torch.gather(
+        all_value_states.unsqueeze(2),
+        dim=3, 
+        index=expanded_indices
+    ).squeeze(2)
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states, topk_key_states, topk_value_states, dropout_p=0.0
+    )
+
+    return attn_output
 
 class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -542,7 +566,170 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        
+        lck = len(cache_hidden[0])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
+        if use_cache:
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+            )
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_cache, value_cache = past_key_values.update(
+                key_states,
+                value_states,
+                layer_idx=0,  # TODO: support multiple layers
+                cache_kwargs=cache_kwargs,
+            )
+        else:
+            key_cache, value_cache = key_states, value_states
+
+        all_key_states = repeat_kv(key_cache, self.num_key_value_groups)
+        all_value_states = repeat_kv(value_cache, self.num_key_value_groups)
+
+        nvtx.range_push("sdpa_attention")
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states, all_key_states, all_value_states, dropout_p=0.0
+        )
+        nvtx.range_pop()
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class DeepseekAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.indexer = Indexer(config)
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(
+            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000),
+            )
+        else:
+            scaling_type = self.config.rope_scaling["rope_type"]
+            if hasattr(self.config.rope_scaling, "factor"):
+                scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "llama3":
+                # for nv type
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "mrope":
+                self.rotary_emb = LlamaMutiRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "yarn":
+                self.rotary_emb = LlamaYarnRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    original_max_position_embeddings=self.config.rope_scaling[
+                        "original_max_position_embeddings"
+                    ],
+                    scaling_factor=self.config.rope_scaling["factor"],
+                    beta_fast=self.config.rope_scaling["beta_fast"],
+                    beta_slow=self.config.rope_scaling["beta_slow"],
+                    mscale=self.config.rope_scaling["mscale"],
+                    mscale_all_dim=self.config.rope_scaling["mscale_all_dim"],
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -557,85 +744,74 @@ class LlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        if cache_hidden is None:
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
-            else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
-                )
-
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
+        lck = len(cache_hidden[0])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
                 query_states,
                 key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
+        # training use_cache = False
+        if use_cache:
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+            )
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_cache, value_cache = past_key_values.update(
+                key_states,
                 value_states,
+                layer_idx=0,  # TODO: support multiple layers
+                cache_kwargs=cache_kwargs,
+            )
+        else:
+            key_cache, value_cache = key_states, value_states
+
+        all_key_states = repeat_kv(key_cache, self.num_key_value_groups)
+        all_value_states = repeat_kv(value_cache, self.num_key_value_groups)
+        
+        nvtx.range_push("indexer")
+        index_mask, topk_indices = self.indexer(
+            query_states, 
+            key_states, 
+            cache_hidden, 
+            past_key_values=past_key_values, 
+            mask=attention_mask, 
+        use_cache=use_cache) # (bsz, head_num, q_len, K)
+        nvtx.range_pop()
+
+        if q_len == 1:
+            nvtx.range_push("topk_attention")
+            attn_output = optimized_topk_attention(
+                query_states,
+                all_key_states,
+                all_value_states,
+                topk_indices,
+                self.head_dim
+            )
+            nvtx.range_pop()
+        else:
+            attention_mask = (attention_mask + index_mask).to(query_states.dtype)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                all_key_states,
+                all_value_states,
                 attn_mask=attention_mask,
                 is_causal=attention_mask is None,
                 dropout_p=0.0,
             )
-
-        else:
-            lck = len(cache_hidden[0])
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
-            else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
-                )
-
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-            # training use_cache = Fales
-            if use_cache:
-                cache_hidden[0] = cache_hidden[0] + [key_states]
-                cache_hidden[1] = cache_hidden[1] + [value_states]
-            else:
-                cache_hidden[0] = [key_states]
-                cache_hidden[1] = [value_states]
-
-            cache_k = cache_hidden[0]
-            cache_v = cache_hidden[1]
-
-            k_all = torch.cat(cache_k, dim=2)
-            attn_weights = torch.matmul(query_states, k_all.transpose(2, 3)) / math.sqrt(self.head_dim)
-            attn_weights = attn_weights + attention_mask
-
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
-
-            v_all = torch.cat(cache_v, dim=2)
-            attn_output = torch.matmul(attn_weights, v_all) # (bzs, head_num, sql, head_dim)
-
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
-
         attn_output = self.o_proj(attn_output)
-
         return attn_output
 
 class LlamaFlexAttention(LlamaAttention):
@@ -822,8 +998,7 @@ class LlamaDecoderLayer(nn.Module):
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "dsa":
-            self.indexer = Indexer(config)
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = DeepseekAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
         self.attention_backend = attention_backend
@@ -864,16 +1039,6 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
-        if self.attention_backend == "dsa":
-            attention_mask = self.indexer(hidden_states, input_emb, cache_hidden, mask=attention_mask)
-        # attention_mask += index_mask
-        """
-        bsz, seq_len, _ = hidden_states.shape
-        attention_mask = prepare_decoder_attention_mask(
-            attention_mask, (bsz, seq_len), hidden_states, 0
-        )
-        attention_mask += index_mask
-        """
 
         residual = hidden_states
 
@@ -882,6 +1047,7 @@ class LlamaDecoderLayer(nn.Module):
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         # Self Attention
+        nvtx.range_push("self_attn")
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
@@ -891,6 +1057,7 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        nvtx.range_pop()
         hidden_states = residual + hidden_states
 
         # Fully Connected
