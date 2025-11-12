@@ -248,8 +248,12 @@ def main():
 
     last_time = time.time()
     total_samples = 0
-
+    
+    idx = 0
     for data in progress_bar:
+        if idx > 10:
+            exit()
+        idx += 1
         if args.is_vlm:
             with torch.no_grad():
                 accept_length = evaluator.evaluation(
@@ -268,7 +272,6 @@ def main():
                     image_grid_thw=data["image_grid_thw"].cuda(),
                 )
                 """
-        exit()
         eval_accept_length.append(accept_length)
         total_samples += data["input_ids"].shape[0]
 

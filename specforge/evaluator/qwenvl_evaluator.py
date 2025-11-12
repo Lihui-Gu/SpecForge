@@ -114,7 +114,6 @@ class QwenVLEagle3Evaluator():
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         for step in range(self.draft_length - 1):
-            # print(f"### draft generate step : {step}")
             bsz, seq_len = current_ids.shape
 
             # Step 1: Prepare input embeddings

@@ -5,22 +5,23 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # support tp1 evaluate eagle3 for qwen2.5-vl-7b-instruct
 NUM_GPUS=1
-CHECKPOINT_PATH=$ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3-dsa/epoch_7
 # allava4v_qwen2_5_vl_test.jsonl
-
+CHECKPOINT_PATH=$ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3-dsa/epoch_7
+DRAFT_MODEL_CONFIG=$ROOT_DIR/configs/qwen2-5-vl-7b-eagle3-dsa.json
+ATTENTION_BACKEND=dsa
 
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/eval_eagle3.py \
     --target-model-path Qwen/Qwen2.5-VL-7B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/qwen2-5-vl-7b-eagle3-dsa.json \
+    --draft-model-config $DRAFT_MODEL_CONFIG \
     --checkpoint-path $CHECKPOINT_PATH \
     --eval-data-path $ROOT_DIR/cache/dataset/allava4v_qwen2_5_vl_test.jsonl \
     --max-length 8192 \
     --dist-timeout 360 \
     --chat-template qwen2-vl \
-    --attention-backend dsa \
+    --attention-backend $ATTENTION_BACKEND \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
     --tp-size 1 \

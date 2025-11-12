@@ -16,6 +16,7 @@ from specforge.modeling.draft.flex_attention import (
     generate_eagle3_mask,
 )
 from specforge.utils import print_with_rank
+from specforge.modeling.utils import repeat_kv
 
 from .base import Eagle3DraftModel
 from .sparse_attention import Indexer
@@ -68,20 +69,6 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(
         inverted_mask.to(torch.bool), torch.finfo(dtype).min
     )
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 def rotate_half(x):
@@ -786,7 +773,7 @@ class DeepseekAttention(nn.Module):
             cache_hidden, 
             past_key_values=past_key_values, 
             mask=attention_mask, 
-        use_cache=use_cache) # (bsz, head_num, q_len, K)
+            use_cache=use_cache) # (bsz, head_num, q_len, K)
         nvtx.range_pop()
 
         if q_len == 1:

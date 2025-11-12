@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from specforge.kernel import act_quant, fp8_gemm, fp8_index
 from specforge.utils import print_with_rank
-from specforge.modeling.utils import precompute_freqs_cis, apply_rotary_emb
+from specforge.modeling.utils import precompute_freqs_cis, apply_rotary_emb, repeat_kv
+
 class LayerNorm(nn.Module):
     """
     Layer Normalization.
@@ -116,6 +117,7 @@ class Indexer(torch.nn.Module):
         self.dim: int = config.hidden_size
         self.num_key_value_heads = config.num_key_value_heads
         self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.num_heads: int = config.index_n_heads
         self.head_dim: int = config.index_head_dim
         self.rope_head_dim: int = config.qk_rope_head_dim
@@ -140,16 +142,17 @@ class Indexer(torch.nn.Module):
     ):
         bsz, _, seq_len, _ = query_states.shape
         past_seen_tokens = (
-            past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_key_values.get_seq_length(layer_idx=1) if past_key_values is not None else 0
         )
         end_pos = past_seen_tokens + seq_len
-        _, _, q_len, kv_len = mask.shape
-        query_states = rearrange(query_states, 'b n s d -> (b n) s d', n=self.num_attention_heads)
-        key_states = rearrange(key_states, 'b n s d -> (b n) s d', n=self.num_key_value_heads)
 
+        _, _, q_len, kv_len = mask.shape
         q = self.wq_b(query_states)
-        q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
-        k = self.wk(key_states)
+        q = rearrange(q, 'b n s (h d) -> (b n) s h d', n=self.num_attention_heads, d=self.head_dim)
+        
+        k = repeat_kv(key_states, self.num_key_value_groups)
+        k = rearrange(k, 'b n s d -> (b n) s d', n=self.num_attention_heads)
+        k = self.wk(k)
         k = self.k_norm(k) # (bsz, sql, index_head_num)
 
         q_fp8, q_scale = act_quant(q, self.block_size, self.scale_fmt)
@@ -160,14 +163,12 @@ class Indexer(torch.nn.Module):
                 past_seen_tokens, past_seen_tokens + q_len, device=query_states.device
             )
             cache_kwargs = {"cache_position": cache_position}
-
             k_fp8_cache, _ = past_key_values.update(
                 k_fp8,
                 torch.empty_like(k_fp8),
                 layer_idx=1,  # TODO: support multiple layers
                 cache_kwargs=cache_kwargs,
             )
-
             k_scale_cache, _ = past_key_values.update(
                 k_scale,
                 torch.empty_like(k_scale),
@@ -178,7 +179,7 @@ class Indexer(torch.nn.Module):
             k_fp8_cache, k_scale_cache = k_fp8, k_scale
 
         weights = self.weights_proj(query_states) * self.num_heads ** -0.5
-
+        weights = rearrange(weights, 'b n s d -> (b n) s d', n=self.num_attention_heads)
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         
         index_score = fp8_index(q_fp8.contiguous(), weights, k_fp8_cache.contiguous(), k_scale_cache.contiguous()) # (bsz, q_len, kv_len)
@@ -194,9 +195,5 @@ class Indexer(torch.nn.Module):
             float("-inf"),
             device=query_states.device
         ).scatter_(-1, topk_indices, 0)
-
-        # 改回来
-        query_states = rearrange(query_states, '(b n) s d -> b n s d', n=self.num_attention_heads)
-        key_states = rearrange(key_states, '(b n) s d -> b n s d', n=self.num_key_value_heads)
 
         return index_mask, topk_indices
