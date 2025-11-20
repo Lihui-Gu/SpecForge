@@ -5,14 +5,14 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # support tp1 evaluate eagle3 for qwen2.5-vl-7b-instruct
 NUM_GPUS=1
-CHECKPOINT_PATH=$ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3-dsa/epoch_7
-DRAFT_MODEL_CONFIG=$ROOT_DIR/configs/qwen2-5-vl-7b-eagle3-dsa.json
-ATTENTION_BACKEND=dsa
-
+CHECKPOINT_PATH=$ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3/epoch_7
+DRAFT_MODEL_CONFIG=$ROOT_DIR/configs/qwen2-5-vl-7b-eagle3.json
+ATTENTION_BACKEND=sdpa
+# ATTENTION_BACKEND=dsa
 # allava4v_qwen2_5_vl_test.jsonl
 
 # 输出分析文件名
-PROFILE_NAME="eagle3_eval_dsa"
+PROFILE_NAME="eagle3_eval_sdpa"
 OUT_DIR="$ROOT_DIR/nsys_logs"
 mkdir -p $OUT_DIR
 

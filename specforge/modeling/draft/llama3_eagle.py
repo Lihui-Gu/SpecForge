@@ -603,16 +603,24 @@ class LlamaAttention(nn.Module):
 
         all_key_states = repeat_kv(key_cache, self.num_key_value_groups)
         all_value_states = repeat_kv(value_cache, self.num_key_value_groups)
-
-        nvtx.range_push("sdpa_attention")
+        # nvtx.range_push("sdpa_attention")
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states, all_key_states, all_value_states, dropout_p=0.0
+            query_states, 
+            all_key_states, 
+            all_value_states, 
+            is_causal=(past_seen_tokens == 0), 
+            attn_mask=attention_mask,
+            dropout_p=0.0
         )
-        nvtx.range_pop()
-
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"### sdpa cost time {start_event.elapsed_time(end_event):.3f} ms")
+        # nvtx.range_pop()
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
-
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -777,7 +785,11 @@ class DeepseekAttention(nn.Module):
         nvtx.range_pop()
 
         if q_len == 1:
-            nvtx.range_push("topk_attention")
+            # time_list = []
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            # nvtx.range_push("topk_attention")
             attn_output = optimized_topk_attention(
                 query_states,
                 all_key_states,
@@ -785,7 +797,11 @@ class DeepseekAttention(nn.Module):
                 topk_indices,
                 self.head_dim
             )
-            nvtx.range_pop()
+            # nvtx.range_pop()
+            end_event.record()
+            torch.cuda.synchronize()
+            # time_list.append(start_event.elapsed_time(end_event))
+            print(f"### dsa cost time {start_event.elapsed_time(end_event):.3f} ms")
         else:
             attention_mask = (attention_mask + index_mask).to(query_states.dtype)
             attn_output = torch.nn.functional.scaled_dot_product_attention(

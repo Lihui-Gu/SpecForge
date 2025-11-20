@@ -153,6 +153,7 @@ class QwenVLEagle3Evaluator():
             position_ids = position_ids[:, :, -seq_len:]
 
             # Step 4: Forward pass through draft model backbone
+            start_event.record()
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
@@ -162,6 +163,10 @@ class QwenVLEagle3Evaluator():
                 cache_hidden=cache_hidden,  # Enable KV cache management
                 use_cache=True,
             )
+            end_event.record()
+            torch.cuda.synchronize()
+            step_times.append(start_event.elapsed_time(end_event))
+
             # Step 5: Update hidden states (take last token output)
             hidden_states = hidden_states_out[:, -1:, :]
 
@@ -171,7 +176,6 @@ class QwenVLEagle3Evaluator():
 
             # Greedy decoding: select token with highest probability
             next_token_ids = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
             # Map to target model vocabulary space
             next_token_ids = next_token_ids + self.draft_model.d2t[next_token_ids]
 
@@ -181,21 +185,12 @@ class QwenVLEagle3Evaluator():
             current_ids = next_token_ids
             seq_length_with_past += seq_len
 
+        print("### step times: ")
+        print(step_times)
         # Step 8: Clean up KV cache (trim to valid length)
-        """
-        if self.attention_backend == "sdpa" or self.attention_backend == "dsa":
-            cache_hidden[0] = cache_hidden[0][:lck + 1]
-            cache_hidden[1] = cache_hidden[1][:lck + 1]
-            cache_hidden[2] = cache_hidden[2][:lck + 1]
-            cache_hidden[3] = cache_hidden[3][:lck + 1]
-            cache_hidden[4] = cache_hidden[4][:lck + 1] # top k indices
-            cache_hidden[5] = cache_hidden[5][:lck + 1] # attention weights
-            past_key_values.crop(past_seen_tokens)
-        elif self.attention_backend == "flex_attention":
-        """
         past_key_values.crop(past_seen_tokens)
         # Return generated candidate sequence (exclude input, keep draft portion only)
-        return generated_ids[:, -(self.draft_length-1):]
+        return generated_ids[:, -(self.draft_length-1):] 
 
     def evaluation(
         self,
